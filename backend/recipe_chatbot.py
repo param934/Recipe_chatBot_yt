@@ -189,40 +189,37 @@ def extract_recipe(transcript):
     prompt = EXTRACTION_PROMPT.format(transcript=transcript)
     return query_llm(prompt)
 
-import asyncio
-
-async def query_llm_stream(prompt, model="llama3", websocket=None):
+async def query_llm_stream(prompt, model="llama3", emit_func=None):
     """
-    Queries the LLAMA model and streams the response over WebSocket.
-    Also prints the response to the CLI.
+    Queries the LLAMA model and streams the response using the emit function.
     """
     try:
         model_instance = Ollama(model=model)
-        # We expect a synchronous generator from this method
         response_stream = model_instance.stream(prompt)
         
-        # Use asyncio to iterate through the chunks synchronously
+        accumulated_text = ""
+        
         for chunk in response_stream:
-            # Check if chunk is a dictionary or a string
             if isinstance(chunk, dict):
                 chunk_text = chunk.get('text', '')
             else:
-                chunk_text = chunk
+                chunk_text = str(chunk)
             
-            # Print each chunk to the CLI
-            print(chunk_text, end='', flush=True)
-            
-            # Send each chunk of text progressively to the WebSocket client
-            if websocket:
-                await websocket.send(chunk_text)
+            if chunk_text.strip():
+                accumulated_text += chunk_text
+                if emit_func:
+                    emit_func('response', {"content": chunk_text})
+                    # Force a small delay between chunks
+                    await asyncio.sleep(0.05)
+        
+        return accumulated_text
 
     except Exception as e:
-        if websocket:
-            await websocket.send(f"Error querying LLM: {e}")
-        print(f"Error querying LLM: {e}")
-
-
-
+        error_message = f"Error querying LLM: {e}"
+        if emit_func:
+            emit_func('response', {"error": error_message})
+        print(error_message)
+        return error_message
 
 # Recipe ChatBot Class
 class RecipeChatBot:
@@ -297,37 +294,50 @@ class RecipeChatBot:
         # If there's no close match or only one strong match, return the top category
         return sorted_categories[0][0] if sorted_categories else "general"
 
-
-    def ask_question(self, question):
+    async def ask_question(self, question, emit_func):
         """
         Generate a response to the user's question based on the classified intent.
         """
         if not self.recipe_data:
-            return "Please fetch a recipe first by providing a video URL."
+            emit_func('response', {"error": "Please fetch a recipe first by providing a video URL."})
+            return
 
-        # Determine the appropriate prompt
-        intent = self.classify_question(question)
-        prompt_mapping = {
-            "nutrition": NUTRITION_PROMPT,
-            "substitution": SUBSTITUTION_PROMPT,
-            "procedure": PROCEDURE_PROMPT,
-            "dietary": DIETARY_PROMPT,
-            "storage": STORAGE_PROMPT,
-            "flavor": FLAVOR_PROMPT,
-            "cultural": CULTURAL_PROMPT,
-            "safety": SAFETY_PROMPT,
-            "general": GENERAL_PROMPT,
-        }
-        prompt = prompt_mapping[intent].format(recipe_data=self.recipe_data, user_question=question)
-        # print("===Promot==="+prompt)
-        # Query the LLM
-        # response = query_llm(prompt, model=self.model)
-        response=asyncio.run(query_llm_stream(prompt, model=self.model))
-        # Update conversation history
-        self.conversation_history.append({"role": "user", "content": question})
-        self.conversation_history.append({"role": "assistant", "content": response})
+        try:
+            # Determine the appropriate prompt
+            intent = self.classify_question(question)
+            prompt_mapping = {
+                "nutrition": NUTRITION_PROMPT,
+                "substitution": SUBSTITUTION_PROMPT,
+                "procedure": PROCEDURE_PROMPT,
+                "dietary": DIETARY_PROMPT,
+                "storage": STORAGE_PROMPT,
+                "flavor": FLAVOR_PROMPT,
+                "cultural": CULTURAL_PROMPT,
+                "safety": SAFETY_PROMPT,
+                "general": GENERAL_PROMPT,
+            }
+            prompt = prompt_mapping[intent].format(
+                recipe_data=self.recipe_data, 
+                user_question=question,
+                conversation_history="\n".join(
+                    [f"{msg['role']}: {msg['content']}" for msg in self.conversation_history]
+                )
+            )
 
-        return response
+            # Query the LLM asynchronously and stream the response
+            assistant_response = ""
+            async for chunk in query_llm_stream(prompt, model=self.model, emit_func=emit_func):
+                assistant_response += chunk  # Collect the response progressively
+
+            # Update conversation history
+            self.conversation_history.append({"role": "user", "content": question})
+            self.conversation_history.append({"role": "assistant", "content": assistant_response})
+
+        except Exception as e:
+            error_message = f"Error in ask_question: {e}"
+            emit_func('response', {"error": error_message})
+            print(error_message)
+
 
     def display_conversation(self):
         """
@@ -360,5 +370,5 @@ if __name__ == "__main__":
                 print("Thank you for using the Recipe ChatBot! Goodbye.")
                 break
 
-            response = bot.ask_question(user_question)
+            response = asyncio.run(bot.ask_question(user_question))
             # print("\nAssistant:", response)
